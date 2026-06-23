@@ -3,14 +3,47 @@ if (-not $AppID -or [string]::IsNullOrWhiteSpace($AppID)) {
     $AppID = Read-Host "Enter Steam AppID"
 }
 
+# Show-LuaError — surface a hard-stop error BOTH in the console (status pane)
+# and as a blocking Windows popup in the user's face, because most users ignore
+# the scrolling console text. $Title is the popup caption, $Message is the body
+# (use plain \n line breaks). Best-effort popup: if the GUI subsystem isn't
+# available it silently falls back to the console block, so it never breaks the
+# script. Always prints the console version too.
+function Show-LuaError {
+    param(
+        [string]$Title,
+        [string]$Message
+    )
+    Write-Host "`n========================================================" -ForegroundColor Red
+    Write-Host " $Title" -ForegroundColor Red
+    Write-Host "========================================================" -ForegroundColor Red
+    foreach ($line in ($Message -split "`n")) {
+        Write-Host "  $line" -ForegroundColor Yellow
+    }
+    Write-Host "========================================================" -ForegroundColor Red
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $form = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $true }
+        [void][System.Windows.Forms.MessageBox]::Show(
+            $form,
+            $Message,
+            $Title,
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        )
+        $form.Dispose()
+    }
+    catch {
+        # GUI not available — the console block above is the fallback.
+    }
+}
+
 # ========================
 # UNRELEASED GAME OVERRIDES
 # Games not yet on Steam - detected by folder name instead of appmanifest
 # Format: AppID -> @{ FolderName = "..."; GameName = "..."; MainExe = "..." }
 # ========================
-$unreleasedGames = @{
-    "2215200" = @{ FolderName = "LEGO Batman Legacy of the Dark Knight"; GameName = "LEGO Batman: Legacy of the Dark Knight"; MainExe = "LEGOBatmanLotDK.exe" }
-}
+$unreleasedGames = @{}
 $isUnreleased = $unreleasedGames.ContainsKey($AppID)
 
 # ========================
@@ -72,6 +105,8 @@ $customLaunchers = @{
     "1971870" = @{ Exe = "tokeer_launcher.exe"; GameName = "Mortal Kombat 1" }
     # Persona 3 Reload (Denuvo + tokeer)
     "2161700" = @{ Exe = "tokeer_launcher.exe"; GameName = "Persona 3 Reload" }
+    # LEGO Batman: Legacy of the Dark Knight (Denuvo + tokeer)
+    "2215200" = @{ Exe = "tokeer_launcher.exe"; GameName = "LEGO Batman: Legacy of the Dark Knight" }
     # Like a Dragon Gaiden: The Man Who Erased His Name (Denuvo + tokeer) — launcher lives in runtime\media
     "2375550" = @{ Exe = "runtime\media\tokeer_launcher.exe"; GameName = "Like a Dragon Gaiden: The Man Who Erased His Name" }
     # SONIC X SHADOW GENERATIONS (Denuvo + tokeer)
@@ -80,14 +115,27 @@ $customLaunchers = @{
     "3061810" = @{ Exe = "runtime\media\tokeer_launcher.exe"; GameName = "Like a Dragon: Pirate Yakuza in Hawaii" }
     # WWE 2K26 (Denuvo + tokeer)
     "3717070" = @{ Exe = "tokeer_launcher.exe"; GameName = "WWE 2K26" }
+    # 007 First Light (Denuvo + tokeer)
+    "3768760" = @{ Exe = "tokeer_launcher.exe"; GameName = "007 First Light" }
     # Street Fighter 6 (Denuvo + tokeer)
     "1364780" = @{ Exe = "tokeer_launcher.exe"; GameName = "Street Fighter 6" }
-    # F1 25 (Denuvo + tokeer)
-    "3059520" = @{ Exe = "tokeer_launcher.exe"; GameName = "F1 25" }
+    # The Adventures of Elliot: The Millennium Tales (Denuvo + tokeer)
+    "3483510" = @{ Exe = "tokeer_launcher.exe"; GameName = "The Adventures of Elliot: The Millennium Tales" }
 
 
-    
+
 }
+
+# ========================
+# FORCE-GBE OVERRIDE
+# AppIDs that must use the GBE/tokeer_launcher method even when OpenSteamTool is
+# active — for Denuvo titles that reject the OST registry ticket (code 88500012).
+# Keep this in sync with the bot's /tokeer-gbe-add list. Example:
+#   $forceGbe = @("493340", "2688950")
+# ========================
+$forceGbe = @(
+)
+$isForceGbe = $forceGbe -contains $AppID
 
 # ========================
 # VALIDATION MODE
@@ -104,6 +152,10 @@ $reportData = [ordered]@{
     ConflictingFiles     = @()
 
     WindowsUpdateBlocked = $false
+    OstActive            = $false
+    OstEngine            = "none"
+    OstTomlOk            = $false
+    UpdatesDisabled      = $false   # manifest pinning removed; always false now
 }
 
 Write-Host "Looking for Steam installation..." -ForegroundColor Cyan
@@ -128,6 +180,50 @@ function Add-SteamCandidate {
     if ($Candidates -notcontains $normalized) {
         [void]$Candidates.Add($normalized)
     }
+}
+
+function Get-GameTreeMatches {
+    # Walk the game folder ONCE with .NET (far faster than repeated
+    # Get-ChildItem -Recurse) and return the full paths whose leaf name matches
+    # one of the given file/dir name sets. Falls back to a single Get-ChildItem
+    # pass if the .NET enumerator trips on an odd/locked tree.
+    param(
+        [string]$Root,
+        [string[]]$FileNames = @(),
+        [string[]]$DirNames = @()
+    )
+    $result = @{
+        Files = [System.Collections.Generic.List[string]]::new()
+        Dirs  = [System.Collections.Generic.List[string]]::new()
+    }
+    if ([string]::IsNullOrWhiteSpace($Root) -or -not (Test-Path -LiteralPath $Root)) { return $result }
+
+    $fileSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($n in $FileNames) { [void]$fileSet.Add($n) }
+    $dirSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($n in $DirNames) { [void]$dirSet.Add($n) }
+
+    try {
+        if ($fileSet.Count -gt 0) {
+            foreach ($p in [System.IO.Directory]::EnumerateFiles($Root, '*', [System.IO.SearchOption]::AllDirectories)) {
+                if ($fileSet.Contains([System.IO.Path]::GetFileName($p))) { [void]$result.Files.Add($p) }
+            }
+        }
+        if ($dirSet.Count -gt 0) {
+            foreach ($p in [System.IO.Directory]::EnumerateDirectories($Root, '*', [System.IO.SearchOption]::AllDirectories)) {
+                if ($dirSet.Contains([System.IO.Path]::GetFileName($p))) { [void]$result.Dirs.Add($p) }
+            }
+        }
+    }
+    catch {
+        # Fallback: still ONE walk (not one-per-name) if the fast path errors out.
+        $result.Files.Clear(); $result.Dirs.Clear()
+        Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.PSIsContainer) { if ($dirSet.Contains($_.Name)) { [void]$result.Dirs.Add($_.FullName) } }
+            elseif ($fileSet.Contains($_.Name)) { [void]$result.Files.Add($_.FullName) }
+        }
+    }
+    return $result
 }
 
 function Remove-GbeValidationFiles {
@@ -162,38 +258,33 @@ function Remove-GbeValidationFiles {
     )
 
     $removed = 0
-    foreach ($name in $fileNames) {
-        $hits = Get-ChildItem -LiteralPath $root -Recurse -File -Force -Filter $name -ErrorAction SilentlyContinue
-        foreach ($hit in $hits) {
-            $full = $hit.FullName
-            if (-not ($full.StartsWith($root + "\", [System.StringComparison]::OrdinalIgnoreCase))) { continue }
-            try {
-                Remove-Item -LiteralPath $full -Force -ErrorAction Stop
-                $rel = $full.Substring($root.Length).TrimStart('\', '/')
-                Write-Host "    [-] Removed $rel" -ForegroundColor DarkGray
-                $removed++
-            }
-            catch {
-                Write-Host "    [!] Could not remove $($hit.FullName): $($_.Exception.Message)" -ForegroundColor Yellow
-            }
+    # One fast pass for ALL names at once (was one full recursive scan per name).
+    $gbeMatches = Get-GameTreeMatches -Root $root -FileNames $fileNames -DirNames $dirNames
+
+    foreach ($full in $gbeMatches.Files) {
+        if (-not ($full.StartsWith($root + "\", [System.StringComparison]::OrdinalIgnoreCase))) { continue }
+        try {
+            Remove-Item -LiteralPath $full -Force -ErrorAction Stop
+            $rel = $full.Substring($root.Length).TrimStart('\', '/')
+            Write-Host "    [-] Removed $rel" -ForegroundColor DarkGray
+            $removed++
+        }
+        catch {
+            Write-Host "    [!] Could not remove $full`: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
 
-    foreach ($name in $dirNames) {
-        $hits = Get-ChildItem -LiteralPath $root -Recurse -Directory -Force -Filter $name -ErrorAction SilentlyContinue |
-            Sort-Object { $_.FullName.Length } -Descending
-        foreach ($hit in $hits) {
-            $full = $hit.FullName
-            if (-not ($full.StartsWith($root + "\", [System.StringComparison]::OrdinalIgnoreCase))) { continue }
-            try {
-                Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
-                $rel = $full.Substring($root.Length).TrimStart('\', '/')
-                Write-Host "    [-] Removed $rel" -ForegroundColor DarkGray
-                $removed++
-            }
-            catch {
-                Write-Host "    [!] Could not remove $($hit.FullName): $($_.Exception.Message)" -ForegroundColor Yellow
-            }
+    # Delete deepest dirs first so nested matches don't vanish mid-loop.
+    foreach ($full in ($gbeMatches.Dirs | Sort-Object { $_.Length } -Descending)) {
+        if (-not ($full.StartsWith($root + "\", [System.StringComparison]::OrdinalIgnoreCase))) { continue }
+        try {
+            Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+            $rel = $full.Substring($root.Length).TrimStart('\', '/')
+            Write-Host "    [-] Removed $rel" -ForegroundColor DarkGray
+            $removed++
+        }
+        catch {
+            Write-Host "    [!] Could not remove $full`: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
 
@@ -231,13 +322,18 @@ foreach ($candidate in $steamCandidates) {
 }
 
 if (-not $steamPath) {
-    Write-Host "[-] Could not find Steam installation." -ForegroundColor Red
     if ($steamCandidates.Count -gt 0) {
         Write-Host "    Checked paths:" -ForegroundColor Yellow
         foreach ($candidate in $steamCandidates) {
             Write-Host "    - $candidate" -ForegroundColor DarkGray
         }
     }
+    Show-LuaError -Title "Steam not found" -Message @"
+Could not find your Steam installation on this PC.
+
+Make sure Steam is installed normally, then run the validation again.
+If Steam is installed on another drive, open it once so Windows registers it, then retry.
+"@
     Write-Host "Press any key to exit..."
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit
@@ -250,6 +346,17 @@ $libraries = @()
 $vdfPathPattern = '\x22path\x22\s+\x22([^\x22]+)\x22'
 $manifestInstallDirPattern = '\x22installdir\x22\s+\x22([^\x22]+)\x22'
 $manifestNamePattern = '\x22name\x22\s+\x22([^\x22]+)\x22'
+$manifestStateFlagsPattern = '\x22StateFlags\x22\s+\x22(\d+)\x22'
+$manifestBytesToDownloadPattern = '\x22BytesToDownload\x22\s+\x22(\d+)\x22'
+$manifestBytesDownloadedPattern = '\x22BytesDownloaded\x22\s+\x22(\d+)\x22'
+
+# Steam appmanifest install-state, parsed from the matched manifest below.
+# Defaults (-1 / 0) mean "unknown", which makes the install-progress gate skip
+# itself when we can't read them (e.g. unreleased games found by folder instead
+# of an appmanifest).
+$appStateFlags = -1
+$bytesToDownload = 0
+$bytesDownloaded = 0
 
 if (Test-Path $libraryFoldersPath) {
     $content = Get-Content $libraryFoldersPath -Raw
@@ -364,6 +471,16 @@ if ($isUnreleased) {
                 if ($nameMatch.Success) {
                     $gameName = $nameMatch.Groups[1].Value
                 }
+
+                # Capture install state from this manifest so the gate below can
+                # refuse to validate a game Steam is still downloading/updating.
+                $stateFlagsMatch = [regex]::Match($manifestContent, $manifestStateFlagsPattern)
+                if ($stateFlagsMatch.Success) { $appStateFlags = [int64]$stateFlagsMatch.Groups[1].Value }
+                $btdMatch = [regex]::Match($manifestContent, $manifestBytesToDownloadPattern)
+                if ($btdMatch.Success) { $bytesToDownload = [int64]$btdMatch.Groups[1].Value }
+                $bdMatch = [regex]::Match($manifestContent, $manifestBytesDownloadedPattern)
+                if ($bdMatch.Success) { $bytesDownloaded = [int64]$bdMatch.Groups[1].Value }
+
                 break
             }
         }
@@ -455,6 +572,87 @@ if ($gameInstalled -and $AppID -in $defenderExcludedAppIDs) {
     }
 }
 
+# 3.6 Smart App Control (SAC) — detect only.
+# SAC (Windows 11 22H2+) blocks unsigned/low-reputation executables like
+# tokeer_launcher.exe. We only detect it here and tell the user to turn it
+# off themselves, then re-run — we do not touch it automatically.
+Write-Host "`n[*] Checking Smart App Control status..." -ForegroundColor Cyan
+$sacPolicyKey = "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy"
+$sacValueName = "VerifiedAndReputablePolicyState"
+$sacState = $null
+try {
+    $sacState = (Get-ItemProperty -Path $sacPolicyKey -Name $sacValueName -ErrorAction Stop).$sacValueName
+}
+catch {
+    # Key/value missing = SAC not present on this build (older Win10, etc.)
+    $sacState = 0
+}
+
+# 0 = Off, 1 = Enforced (On), 2 = Evaluation. Anything non-zero blocks us.
+if ($sacState -and $sacState -ne 0) {
+    $sacLabel = if ($sacState -eq 1) { "ON (enforced)" } elseif ($sacState -eq 2) { "Evaluation mode" } else { "Active (state=$sacState)" }
+    Show-LuaError -Title "Smart App Control MUST be OFF" -Message @"
+Smart App Control is $sacLabel.
+
+It WILL block the activation (tokeer_launcher.exe) — you cannot get your key until it is turned OFF.
+
+How to turn it off:
+  1. Open Windows Security
+  2. Go to: App & browser control -> Smart App Control settings
+  3. Set it to OFF
+  4. Run this validation again
+
+Note: turning Smart App Control OFF is permanent (Windows won't let you turn it back ON without a full reset), so this is normal and expected.
+"@
+    Write-Host "`nPress any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit
+}
+else {
+    Write-Host "    [+] Smart App Control is OFF or not present." -ForegroundColor Green
+}
+
+# 4.9 Check OpenSteamTool (OST) — the engine that serves the registry/Denuvo ticket.
+# TokeerDRM codes only apply when OST is active, so we detect it the exact same way
+# the OST installer does and report it. (Reported only — the bot decides whether to
+# require it, so this stays safe for the legacy GBE flow.)
+Write-Host "`n[*] Checking OpenSteamTool (OST) engine..." -ForegroundColor Cyan
+$ostCore   = (Test-Path (Join-Path $steamPath "OpenSteamTool.dll")) -or (Test-Path (Join-Path $steamPath "mktl.dll"))
+$ostHijack = (Test-Path (Join-Path $steamPath "dwmapi.dll")) -and (Test-Path (Join-Path $steamPath "xinput1_4.dll"))
+$ostActive = $ostCore -and $ostHijack
+if (Test-Path (Join-Path $steamPath "mktl.dll")) {
+    $ostEngine = "mktl (fork)"
+}
+elseif (Test-Path (Join-Path $steamPath "OpenSteamTool.dll")) {
+    $ostEngine = "OpenSteamTool (official)"
+}
+else {
+    $ostEngine = "none"
+}
+
+# The official OST needs its toml to include config\stplug-in; the mktl fork reads
+# stplug-in natively, so it's always considered OK there.
+$ostTomlOk = $true
+if ($ostActive -and $ostEngine -like "OpenSteamTool*") {
+    $tomlPath = Join-Path $steamPath "opensteamtool.toml"
+    $ostTomlOk = (Test-Path $tomlPath) -and ((Get-Content $tomlPath -Raw) -match "stplug-in")
+}
+
+$reportData.OstActive = $ostActive
+$reportData.OstEngine = $ostEngine
+$reportData.OstTomlOk = $ostTomlOk
+
+if ($ostActive) {
+    Write-Host "    [+] OST engine detected: $ostEngine" -ForegroundColor Green
+    # NOTE: we intentionally do NOT block or warn on a missing toml→stplug-in redirect
+    # here. Redemption happens in the TokeerDRM app/plugin, which refuse to redeem (and
+    # pop a repair/setup prompt) until the engine is fully configured — so the validator
+    # leaves toml setup entirely to them. $ostTomlOk stays in the report for telemetry.
+}
+else {
+    Write-Host "    [-] OpenSteamTool is not installed/active (needed for TokeerDRM codes)." -ForegroundColor Yellow
+}
+
 # 5. Gate check - stop if something is wrong
 $issues = @()
 if (-not $gameInstalled) {
@@ -475,16 +673,44 @@ else {
     if ($quickSize -eq 0) {
         $issues += 'Game folder is empty (0 bytes). The game files may not be fully copied.'
     }
+
+    # Block validation while Steam is still downloading/installing/updating.
+    # $gameInstalled is true the instant the install folder exists, which is the
+    # moment a download STARTS — so without this gate a D-Report code gets
+    # generated for a half-downloaded game. The appmanifest StateFlags + byte
+    # counters tell us whether the game is actually FULLY installed. Only
+    # released games with a parsed manifest are gated; unreleased games (no
+    # manifest, $appStateFlags stays -1) keep their folder-based behaviour.
+    if (-not $isUnreleased -and $appStateFlags -ge 0) {
+        $STATE_FULLY_INSTALLED = 4
+        # Any of these StateFlags bits means Steam is mid download/update/
+        # validate/stage — i.e. the game is NOT ready to validate:
+        #   2 UpdateRequired      32 FilesMissing      128 FilesCorrupt
+        #   256 UpdateRunning     512 UpdatePaused     1024 UpdateStarted
+        #   65536 Reconfiguring   131072 Validating    262144 AddingFiles
+        #   524288 Preallocating  1048576 Downloading  2097152 Staging
+        #   4194304 Committing    8388608 UpdateStopping
+        $STATE_BUSY_MASK = 2 -bor 32 -bor 128 -bor 256 -bor 512 -bor 1024 -bor 65536 -bor 131072 -bor 262144 -bor 524288 -bor 1048576 -bor 2097152 -bor 4194304 -bor 8388608
+        $bytesComplete = ($bytesToDownload -le 0) -or ($bytesDownloaded -ge $bytesToDownload)
+        $installComplete = (($appStateFlags -band $STATE_FULLY_INSTALLED) -ne 0) -and (($appStateFlags -band $STATE_BUSY_MASK) -eq 0) -and $bytesComplete
+        if (-not $installComplete) {
+            $progressText = ''
+            if ($bytesToDownload -gt 0 -and $bytesDownloaded -lt $bytesToDownload) {
+                $pct = [int][math]::Floor(($bytesDownloaded / $bytesToDownload) * 100)
+                $progressText = " (about $pct% downloaded)"
+            }
+            $issues += "Game with AppID $AppID is still downloading/installing/updating in Steam$progressText. Wait until Steam shows it as fully installed (not 'Queued', 'Downloading', or 'Updating'), then run the validation again."
+        }
+    }
 }
 if (-not $updateBlocked) {
     $issues += "Windows Update is not disabled. Please disable it using WUB: https://www.sordum.org/9470/windows-update-blocker-v1-8/"
 }
 
 if ($issues.Count -gt 0) {
-    Write-Host "`n[!] Please fix the following before running this script:" -ForegroundColor Red
-    foreach ($issue in $issues) {
-        Write-Host "    - $issue" -ForegroundColor Yellow
-    }
+    $issueBody = "Please fix the following before running the validation again:`n`n"
+    $issueBody += (($issues | ForEach-Object { "- $_" }) -join "`n`n")
+    Show-LuaError -Title "Fix these before continuing" -Message $issueBody
     Write-Host "`nPress any key to exit..."
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit
@@ -655,32 +881,42 @@ Write-Host "[+] Exe files: $($exeFiles -join ', ')" -ForegroundColor Green
 
 # 5. Goldberg scan
 Write-Host "`n[*] Scanning for Goldberg Emulator files..." -ForegroundColor Cyan
-$goldbergIndicators = @("steam_settings", "steam_interfaces.txt", "coldclientloader.ini", "local_save.txt", "configs.user.ini")
 $foundGoldberg = $false
 $goldbergFoundPaths = @()
 
-foreach ($indicator in $goldbergIndicators) {
-    $found = Get-ChildItem -LiteralPath $installDir -Recurse -Force -Filter $indicator -ErrorAction SilentlyContinue
-    foreach ($match in $found) {
-        $relativePath = $match.FullName.Substring($installDir.Length).TrimStart('\', '/')
+# Single fast pass for every indicator + the steam_api DLLs at once (was 6
+# separate full recursive walks of the game folder).
+$gbFileIndicators = @("steam_interfaces.txt", "coldclientloader.ini", "local_save.txt", "configs.user.ini", "steam_api.dll", "steam_api64.dll")
+$gbDirIndicators = @("steam_settings")
+$gbScan = Get-GameTreeMatches -Root $installDir -FileNames $gbFileIndicators -DirNames $gbDirIndicators
+
+foreach ($match in $gbScan.Dirs) {
+    $relativePath = $match.Substring($installDir.Length).TrimStart('\', '/')
+    $foundGoldberg = $true
+    $reportData.GoldbergFiles += $relativePath
+    $goldbergFoundPaths += $match
+}
+foreach ($match in $gbScan.Files) {
+    $leaf = [System.IO.Path]::GetFileName($match)
+    if ($leaf -ieq "steam_api.dll" -or $leaf -ieq "steam_api64.dll") {
+        # Only a Goldberg-PATCHED steam_api DLL counts (the real Steam one doesn't).
+        try {
+            $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($match)
+            if ($versionInfo.ProductName -match "Goldberg" -or $versionInfo.CompanyName -match "Goldberg" -or $versionInfo.FileDescription -match "Goldberg") {
+                $foundGoldberg = $true
+                $relativePath = $match.Substring($installDir.Length).TrimStart('\', '/')
+                $reportData.GoldbergFiles += "$relativePath (patched DLL)"
+                $goldbergFoundPaths += $match
+            }
+        }
+        catch {}
+    }
+    else {
+        $relativePath = $match.Substring($installDir.Length).TrimStart('\', '/')
         $foundGoldberg = $true
         $reportData.GoldbergFiles += $relativePath
-        $goldbergFoundPaths += $match.FullName
+        $goldbergFoundPaths += $match
     }
-}
-
-$steamDlls = Get-ChildItem -LiteralPath $installDir -Recurse -Include "steam_api.dll", "steam_api64.dll" -ErrorAction SilentlyContinue
-foreach ($dll in $steamDlls) {
-    try {
-        $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($dll.FullName)
-        if ($versionInfo.ProductName -match "Goldberg" -or $versionInfo.CompanyName -match "Goldberg" -or $versionInfo.FileDescription -match "Goldberg") {
-            $foundGoldberg = $true
-            $relativePath = $dll.FullName.Substring($installDir.Length).TrimStart('\', '/')
-            $reportData.GoldbergFiles += "$relativePath (patched DLL)"
-            $goldbergFoundPaths += $dll.FullName
-        }
-    }
-    catch {}
 }
 
 if ($foundGoldberg) {
@@ -830,7 +1066,13 @@ if ($isUnreleased) {
     $luaFiles = @()
 }
 else {
-    Write-Host "`n[*] Scanning for .lua files in stplug-in to disable updates/decryption..." -ForegroundColor Cyan
+    # Manifest / lua pinning is REMOVED (2026-06-23). Uncommenting the lua's
+    # setManifestid lines reverts the game to the lua author's OLDER build, which no
+    # longer matches the freshly-minted Denuvo ownership ticket -> 88500012. We never
+    # pin; and if a previous validator run (or the lua author) left any setManifestid
+    # ACTIVE, we re-comment it so the game tracks the LATEST manifest - this also REPAIRS
+    # installs a previous pin already broke. We still locate the lua for LuaFileFound.
+    Write-Host "`n[*] Checking stplug-in lua (no manifest pinning - keeps the build matching the Denuvo ticket)..." -ForegroundColor Cyan
 
     $stpluginDir = Get-ChildItem -Path $steamPath -Directory -Filter "stplug-in" -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object -First 1
 
@@ -855,16 +1097,18 @@ else {
     foreach ($luaFile in $luaFiles) {
         $reportData.LuaFileFound = $true
 
-        # Check if lua is already correctly configured (read-only)
-        $luaRaw = Get-Content $luaFile.FullName -Raw
-        $manifestCommented = ($luaRaw -match "(?m)^\s*--\s*setManifestid\(") -or ($luaRaw -notmatch "setManifestid\(")
-        $dlcCommented = ($luaRaw -notmatch "(?m)^addappid\(.+,.+,.+\)") # no uncommented DLC lines
-        if ($manifestCommented -and $dlcCommented) {
-            $reportData.UpdatesDisabled = $true
-            Write-Host "    [+] $($luaFile.Name) is correctly configured." -ForegroundColor Green
+        # Remove any manifest pin: re-comment active setManifestid lines so the game
+        # tracks the latest manifest (matches the Denuvo ticket).
+        $luaRaw = Get-Content -LiteralPath $luaFile.FullName -Raw
+        $activeCount = ([regex]::Matches($luaRaw, "(?m)^\s*setManifestid\(")).Count
+        if ($activeCount -gt 0) {
+            try { Copy-Item -LiteralPath $luaFile.FullName -Destination ($luaFile.FullName + ".bak_" + (Get-Date -Format 'yyyyMMdd_HHmmss')) -Force } catch {}
+            $unpinned = [regex]::Replace($luaRaw, "(?m)^(\s*)(setManifestid\()", '$1--$2')
+            [System.IO.File]::WriteAllText($luaFile.FullName, $unpinned, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "    [+] $($luaFile.Name): removed $activeCount manifest pin(s) - game tracks the latest manifest." -ForegroundColor Green
         }
         else {
-            Write-Host "    [!] $($luaFile.Name) has update/decryption lines that need manual attention." -ForegroundColor Yellow
+            Write-Host "    [*] $($luaFile.Name): no manifest pins (latest manifest)." -ForegroundColor DarkGray
         }
     }
 
@@ -1090,6 +1334,9 @@ $jsonReport = [ordered]@{
     updates_disabled        = $reportData.UpdatesDisabled
     windows_update_blocked  = $reportData.WindowsUpdateBlocked
     windows_update_services = $wuDetails
+    ost_active              = $reportData.OstActive
+    ost_engine              = $reportData.OstEngine
+    ost_toml_ok             = $reportData.OstTomlOk
     hwid                    = $hwid
     mac_addresses           = $macAddresses
     public_ip               = $publicIp
@@ -1125,8 +1372,9 @@ try {
 
         # For games that need launch options written, defer the D-Report code display
         # until AFTER Steam restart - prevents users from closing the script early
-        # and skipping the launch options write.
-        $deferCodeDisplay = $customLaunchers.ContainsKey($AppID) -and -not $isUnreleased
+        # and skipping the launch options write. (When OST is active we don't write
+        # launch options at all, so there's nothing to defer for.)
+        $deferCodeDisplay = $customLaunchers.ContainsKey($AppID) -and -not $isUnreleased -and (-not $ostActive -or $isForceGbe)
 
         if (-not $deferCodeDisplay) {
             Write-Host ""
@@ -1156,8 +1404,213 @@ catch {
     Write-Host "    [-] Failed to upload report: $($_.Exception.Message)" -ForegroundColor Red
 }
 
+function Get-SteamUpdateStatus {
+    param([string]$SteamPath)
+    # Reads steam.cfg and reports whether Steam client auto-updates are allowed.
+    # BootStrapperInhibitAll=Enable hard-blocks the client from updating, which
+    # also breaks CloudRedirect (it needs an up-to-date Steam).
+    $cfg = Join-Path $SteamPath "steam.cfg"
+    if (Test-Path $cfg) {
+        $content = Get-Content -LiteralPath $cfg -Raw -ErrorAction SilentlyContinue
+        if ($content -match "(?im)^\s*BootStrapperInhibitAll\s*=\s*Enable") {
+            return "disabled"
+        }
+    }
+    return "enabled"
+}
+
+function Invoke-CloudRedirectStFixer {
+    param([string]$SteamPath)
+    # CLI equivalent of CloudRedirect GUI -> Setup -> "Run All Patches".
+    # Patches the SteamTools payload so games work even when ST's payload
+    # server is down (the "no internet connection / update queue" error). The
+    # CLI finds Steam, shuts it down itself, downloads ST core DLLs if missing,
+    # applies the STFixer patches, deploys cloud_redirect.dll, and enables
+    # auto-update.
+    Write-Host "`n[*] Checking SteamTools payload fix (CloudRedirect)..." -ForegroundColor Cyan
+
+    $isAdminCR = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdminCR) {
+        Write-Host "    [-] Not running as Administrator — cannot patch SteamTools. Re-run as admin." -ForegroundColor Yellow
+        return $false
+    }
+
+    # --- Report Steam auto-update status (from steam.cfg) ---
+    $updStatus = Get-SteamUpdateStatus -SteamPath $SteamPath
+    if ($updStatus -eq "disabled") {
+        Write-Host "    [!] Steam auto-updates are OFF (steam.cfg has BootStrapperInhibitAll=Enable)." -ForegroundColor Yellow
+        Write-Host "        The SteamTools fix needs an up-to-date Steam, so updates should be ON." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "    [+] Steam auto-updates are ON." -ForegroundColor Green
+    }
+
+    # --- Skip if already applied for THIS Steam build ---
+    # The fix is keyed to the Steam client version: steam.exe changes (new
+    # LastWriteTime) whenever Steam updates, which is exactly when the payload
+    # patch must be re-applied. If cloud_redirect.dll is present AND our marker
+    # matches the current steam.exe, the patch is already in place — skip the
+    # download + re-patch + Steam shutdown entirely so it doesn't run on every
+    # single validation.
+    $crDll = Join-Path $SteamPath "cloud_redirect.dll"
+    $steamExe = Join-Path $SteamPath "steam.exe"
+    $markerDir = Join-Path $env:LOCALAPPDATA "RolacoToolsValidator"
+    $marker = Join-Path $markerDir "cloudredirect_patched.marker"
+    $currentSig = if (Test-Path $steamExe) { (Get-Item $steamExe).LastWriteTimeUtc.Ticks.ToString() } else { "" }
+
+    if ((Test-Path $crDll) -and (Test-Path $marker) -and $currentSig) {
+        $markedSig = (Get-Content -LiteralPath $marker -Raw -ErrorAction SilentlyContinue).Trim()
+        if ($markedSig -eq $currentSig) {
+            Write-Host "    [+] SteamTools payload fix already applied for this Steam build — skipping." -ForegroundColor Green
+            return $true
+        }
+        Write-Host "    [*] Steam was updated since the last patch — re-applying fix..." -ForegroundColor Cyan
+    }
+    else {
+        Write-Host "    [*] No prior patch detected — applying SteamTools payload fix..." -ForegroundColor Cyan
+    }
+
+    $crExe = Join-Path $env:TEMP "CloudRedirectCLI.exe"
+    $crUrls = @(
+        "https://github.com/Selectively11/CloudRedirect/releases/latest/download/CloudRedirectCLI.exe"
+    )
+    $downloaded = $false
+    foreach ($url in $crUrls) {
+        try {
+            Write-Host "    [*] Downloading CloudRedirect CLI..." -ForegroundColor DarkGray
+            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $crExe -TimeoutSec 120 -ErrorAction Stop
+            $downloaded = $true
+            break
+        }
+        catch {
+            Write-Host "    [-] Download failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    if (-not $downloaded -or -not (Test-Path $crExe)) {
+        Write-Host "    [-] Could not download CloudRedirect CLI; skipping payload fix." -ForegroundColor Red
+        return $false
+    }
+
+    try {
+        # /stfixer shuts Steam down itself before patching, so it's fine that
+        # the launch-options step below also expects Steam closed. Capture the
+        # output (while still showing it) so we can detect specific failures
+        # like an unsupported Steam version and give the user a clear next step.
+        $crOutput = (& $crExe "/stfixer" 2>&1 | Tee-Object -Variable _crLines | Out-String)
+        $exitCode = $LASTEXITCODE
+
+        if ($exitCode -eq 0) {
+            Write-Host "    [+] SteamTools payload fix applied." -ForegroundColor Green
+            # Record the Steam build we patched so future runs can skip.
+            try {
+                New-Item -ItemType Directory -Force -Path $markerDir | Out-Null
+                if ($currentSig) {
+                    Set-Content -LiteralPath $marker -Value $currentSig -NoNewline -Encoding ASCII
+                }
+            }
+            catch {}
+            return $true
+        }
+
+        # Steam too old/new for CloudRedirect — the user just needs to update Steam.
+        if ($crOutput -match "version .* is not supported" -or $crOutput -match "not supported") {
+            $updNote = ""
+            if ($updStatus -eq "disabled") {
+                $updNote = "Your Steam auto-updates are currently OFF (steam.cfg) — turn them back ON so Steam can update.`n`n"
+            }
+            Show-LuaError -Title "Your Steam is out of date" -Message @"
+The SteamTools fix needs an up-to-date Steam, and yours is too old.
+
+${updNote}1. Open Steam and let it fully update (Steam -> top-left -> Check for Steam Client Updates)
+2. Fully close Steam once it finishes updating
+3. Run this validation again
+"@
+            return $false
+        }
+
+        Write-Host "    [-] CloudRedirect STFixer exited with code $exitCode." -ForegroundColor Yellow
+        return $false
+    }
+    catch {
+        Write-Host "    [-] Failed to run CloudRedirect STFixer: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Test-MillenniumInstalled {
+    param([string]$SteamPath)
+    # Millennium (SteamClientHomebrew) loads into Steam via a wsock32.dll proxy +
+    # millennium.dll + python311.dll, with its plugins under Steam\ext. It hosts
+    # the RolacoTools Steam plugin for many users, so it's commonly present.
+    if (-not $SteamPath) { return $false }
+    if (Test-Path (Join-Path $SteamPath "millennium.dll")) { return $true }
+    if (Test-Path (Join-Path $SteamPath "ext\data")) { return $true }
+    return $false
+}
+
+function Start-SteamAndWait {
+    param([string]$SteamPath, [int]$Retries = 3)
+    # Start Steam and CONFIRM it stays up. When Millennium is out of date for the
+    # current Steam build it crashes Steam on launch (faulting module
+    # python311.dll, 0xc0000409) — the files are placed fine but the game never
+    # opens because there's no Steam to launch it. The crash is intermittent, and
+    # relaunching also lets Millennium's pending update apply, so we retry; if it
+    # keeps dying we tell the user the real cause (update Millennium).
+    if (-not $SteamPath) {
+        Write-Host "[-] Steam path unknown — cannot start Steam." -ForegroundColor Red
+        return $false
+    }
+    $steamExe = Join-Path $SteamPath "steam.exe"
+    if (-not (Test-Path $steamExe)) {
+        Write-Host "[-] Could not find Steam executable to start." -ForegroundColor Red
+        return $false
+    }
+    if (Get-Process -Name "steam" -ErrorAction SilentlyContinue) { return $true }  # already up
+
+    $hasMillennium = Test-MillenniumInstalled -SteamPath $SteamPath
+    for ($attempt = 1; $attempt -le $Retries; $attempt++) {
+        Write-Host "`n[*] Starting Steam (attempt $attempt of $Retries)..." -ForegroundColor Cyan
+        Start-Process -FilePath $steamExe
+        Start-Sleep -Seconds 5  # let it spawn before we watch for an early crash
+        $crashed = $false
+        $watchUntil = (Get-Date).AddSeconds(15)
+        while ((Get-Date) -lt $watchUntil) {
+            if (-not (Get-Process -Name "steam" -ErrorAction SilentlyContinue)) { $crashed = $true; break }
+            Start-Sleep -Seconds 3
+        }
+        if (-not $crashed -and (Get-Process -Name "steam" -ErrorAction SilentlyContinue)) {
+            Write-Host "    [+] Steam is up and running." -ForegroundColor Green
+            return $true
+        }
+        Write-Host "    [!] Steam closed right after starting (crash on launch)." -ForegroundColor Yellow
+        if ($hasMillennium) {
+            Write-Host "        Millennium is installed — when it's out of date for the current Steam" -ForegroundColor Yellow
+            Write-Host "        build it crashes Steam on launch (python311.dll). Retrying so its" -ForegroundColor Yellow
+            Write-Host "        pending update can apply..." -ForegroundColor DarkGray
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    if ($hasMillennium) {
+        Show-LuaError -Title "Steam keeps closing on launch (update Millennium)" -Message @"
+Your game files are placed correctly, but Steam closes right after it opens, so the
+game can't launch. This is Millennium crashing Steam — it's out of date for your
+current Steam version. It is NOT the activation.
+
+Fix it once:
+1. Reopen Steam a few times so Millennium's pending update can finish applying, OR
+   open Millennium's settings in Steam and update it to the latest version.
+2. Once Steam opens and STAYS open, launch the game normally — no re-activation needed.
+"@
+    }
+    else {
+        Write-Host "[-] Steam did not stay open after several tries. Open Steam manually, then launch the game." -ForegroundColor Red
+    }
+    return $false
+}
+
 # 8. Restart Steam
-if ($customLaunchers.ContainsKey($AppID) -and -not $isUnreleased) {
+if ($customLaunchers.ContainsKey($AppID) -and -not $isUnreleased -and (-not $ostActive -or $isForceGbe)) {
     Write-Host "`nPress any key to restart Steam and set launch options..." -ForegroundColor Yellow
 }
 else {
@@ -1165,11 +1618,41 @@ else {
 }
 $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 
+# Apply the SteamTools payload fix. Skips automatically if already applied for
+# the current Steam build. When it does run it closes Steam (the CLI does it
+# itself), so it's before the launch-options write, which also needs Steam
+# closed — one shutdown covers both, and Steam is restarted afterward.
+# GATED on -not $ostActive: CloudRedirect patches the *SteamTools* payload and
+# drops cloud_redirect.dll — that's meaningless under OpenSteamTool and can drag
+# SteamTools back in (the exact engine conflict that causes Denuvo code 00). With
+# OST active the engine serves the manifest/ticket itself, so skip it entirely.
+if ($steamPath -and -not $ostActive) {
+    Invoke-CloudRedirectStFixer -SteamPath $steamPath | Out-Null
+}
+elseif ($ostActive) {
+    Write-Host "`n[*] OpenSteamTool is active — skipping the SteamTools CloudRedirect patch." -ForegroundColor DarkGray
+}
+
 # --- Set custom launch options (Steam must be closed for this to persist) ---
-if ($customLaunchers.ContainsKey($AppID) -and -not $isUnreleased -and $installDir -and $steamPath) {
-    Write-Host "`nRestarting Steam..." -ForegroundColor Cyan
-    Stop-Process -Name "steam" -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+# NOTE: gated on -not $ostActive. With OpenSteamTool active the game launches
+# normally (OST serves the registry/Denuvo ticket) — the tokeer_launcher.exe wrapper
+# must NOT be set, and any previously-written launch options are cleared below.
+if ($customLaunchers.ContainsKey($AppID) -and -not $isUnreleased -and (-not $ostActive -or $isForceGbe) -and $installDir -and $steamPath) {
+    Write-Host "`nClosing Steam to write launch options..." -ForegroundColor Cyan
+    # Steam caches config in memory and rewrites localconfig.vdf on exit. If we
+    # touch the VDF while Steam is still alive, our change is either blocked by a
+    # file lock or overwritten by Steam's flush-on-exit. So kill steam.exe AND
+    # steamwebhelper, then POLL until the process is actually gone (up to 20s)
+    # instead of a fixed 2s guess that's too short on slow machines.
+    foreach ($procName in @("steam", "steamwebhelper")) {
+        Stop-Process -Name $procName -Force -ErrorAction SilentlyContinue
+    }
+    $steamDeadline = (Get-Date).AddSeconds(20)
+    while ((Get-Process -Name "steam" -ErrorAction SilentlyContinue) -and (Get-Date) -lt $steamDeadline) {
+        Start-Sleep -Milliseconds 500
+    }
+    # Extra grace so the OS releases the file handles before we write.
+    Start-Sleep -Seconds 1
 
     $cfg = $customLaunchers[$AppID]
     Write-Host "[*] Setting Steam launch options for $($cfg.GameName)..." -ForegroundColor Cyan
@@ -1229,7 +1712,12 @@ if ($customLaunchers.ContainsKey($AppID) -and -not $isUnreleased -and $installDi
                         }
 
                         $newContent = $vdfContent.Substring(0, $startIdx) + $newBody + $vdfContent.Substring($endIdx)
-                        Set-Content -LiteralPath $vdfPath -Value $newContent -Encoding UTF8 -NoNewline
+                        # Write UTF-8 WITHOUT BOM. Windows PowerShell 5.1's
+                        # Set-Content -Encoding UTF8 prepends a BOM, which Steam's
+                        # VDF parser rejects -> it resets the config and the launch
+                        # option vanishes. .NET WriteAllText with UTF8Encoding($false)
+                        # guarantees no BOM on every PowerShell version.
+                        [System.IO.File]::WriteAllText($vdfPath, $newContent, (New-Object System.Text.UTF8Encoding($false)))
                         $writtenCount++
                     }
                     else {
@@ -1239,7 +1727,9 @@ if ($customLaunchers.ContainsKey($AppID) -and -not $isUnreleased -and $installDi
                             $insertPos = $appsMatch.Index + $appsMatch.Length
                             $inject = "`r`n`t`t`t`t`"$AppID`"`r`n`t`t`t`t{`r`n`t`t`t`t`t$newValue`r`n`t`t`t`t}"
                             $newContent = $vdfContent.Substring(0, $insertPos) + $inject + $vdfContent.Substring($insertPos)
-                            Set-Content -LiteralPath $vdfPath -Value $newContent -Encoding UTF8 -NoNewline
+                            # UTF-8 without BOM (see note above) — Set-Content would
+                            # add a BOM on PowerShell 5.1 and break the config.
+                            [System.IO.File]::WriteAllText($vdfPath, $newContent, (New-Object System.Text.UTF8Encoding($false)))
                             $writtenCount++
                         }
                     }
@@ -1251,24 +1741,66 @@ if ($customLaunchers.ContainsKey($AppID) -and -not $isUnreleased -and $installDi
         }
     }
 
-    if ($writtenCount -gt 0) {
-        Write-Host "    [+] Launch options written to $writtenCount config file(s) (local + shared)." -ForegroundColor Green
+    # Verify the option actually landed in at least one file by re-reading,
+    # so a silent failure is visible instead of a false "success".
+    $verifiedCount = 0
+    if (Test-Path $userdataPath) {
+        foreach ($userDir in $userDirs) {
+            foreach ($configName in $configFiles) {
+                $vdfPath = Join-Path $userDir.FullName "config\$configName"
+                if (-not (Test-Path -LiteralPath $vdfPath)) { continue }
+                try {
+                    $check = [System.IO.File]::ReadAllText($vdfPath)
+                    if ($check.Contains([System.IO.Path]::GetFileName($launcherPath))) {
+                        $verifiedCount++
+                    }
+                }
+                catch {}
+            }
+        }
+    }
+
+    if ($verifiedCount -gt 0) {
+        Write-Host "    [+] Launch options set and verified in $verifiedCount config file(s)." -ForegroundColor Green
         Write-Host "        $launchOptionString" -ForegroundColor DarkGray
+    }
+    elseif ($writtenCount -gt 0) {
+        Write-Host "    [!] Wrote launch options to $writtenCount file(s) but could not verify them on re-read." -ForegroundColor Yellow
+        Write-Host "        If the game does not auto-launch the activator, set it manually in Steam:" -ForegroundColor Yellow
+        Write-Host "        Right-click the game -> Properties -> Launch Options -> paste:" -ForegroundColor Yellow
+        Write-Host "        $launchOptionString" -ForegroundColor Cyan
     }
     else {
         Write-Host "    [-] Could not update any Steam config file." -ForegroundColor Yellow
+        Write-Host "        Set it manually in Steam: Right-click the game -> Properties ->" -ForegroundColor Yellow
+        Write-Host "        Launch Options -> paste:" -ForegroundColor Yellow
+        Write-Host "        $launchOptionString" -ForegroundColor Cyan
     }
-    if ($steamPath) {
-        Start-Process -FilePath (Join-Path $steamPath "steam.exe")
-    }
-    else {
-        Write-Host "[-] Could not find Steam executable to restart." -ForegroundColor Red
-    }
+    # Restart Steam and verify it stays up — a Millennium-out-of-date crash here
+    # is exactly why a correctly-placed game "doesn't open" with no error.
+    Start-SteamAndWait -SteamPath $steamPath | Out-Null
 }
 elseif ($isUnreleased) {
     Write-Host "`n[*] Skipping Steam launch options/restart for unreleased game AppID $AppID." -ForegroundColor DarkGray
     Write-Host "[*] Checking for old Steam LaunchOptions written by older validators..." -ForegroundColor Cyan
     Remove-SteamLaunchOptionsForApp -SteamPath $steamPath -TargetAppID $AppID
+}
+elseif ($ostActive -and -not $isForceGbe -and $steamPath) {
+    # OpenSteamTool/registry method: the game launches normally, no tokeer_launcher
+    # wrapper. Strip any custom launch options a previous (legacy) activation left so
+    # Steam runs the real game exe and OST serves the ticket. (Skipped for force-GBE
+    # games — those KEEP their tokeer_launcher even when OST is active.)
+    Write-Host "`n[*] OpenSteamTool is active — clearing any custom Steam launch options for AppID $AppID..." -ForegroundColor Cyan
+    Remove-SteamLaunchOptionsForApp -SteamPath $steamPath -TargetAppID $AppID
+}
+
+# The CloudRedirect STFixer step closes Steam to patch the payload. For games
+# that don't go through the launch-options block above (non-custom-launcher or
+# unreleased), nothing restarts Steam — so bring it back here if it's down, so
+# the patched payload loads and the user can launch normally.
+if ($steamPath -and -not (Get-Process -Name "steam" -ErrorAction SilentlyContinue)) {
+    Write-Host "`n[*] Restarting Steam to load the patched payload..." -ForegroundColor Cyan
+    Start-SteamAndWait -SteamPath $steamPath | Out-Null
 }
 
 # Deferred D-Report code display (for games where launch options were set)
