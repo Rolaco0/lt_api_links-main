@@ -7,7 +7,7 @@ Clear-Host
 # Header
 Write-Host ""
 Write-Host "===============================================================" -ForegroundColor Cyan
-Write-Host "Lua Cleaner - by discord.gg/ZbrzCC8HaK" -ForegroundColor Cyan
+Write-Host "Rolaco Cleaner - by discord.gg/ZbrzCC8HaK" -ForegroundColor Cyan
 Write-Host "===============================================================" -ForegroundColor Cyan
 Write-Host ""
 
