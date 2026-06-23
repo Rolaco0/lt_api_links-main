@@ -1,3 +1,7 @@
+#by @piqseu on discord, thank him by spam pinging him. distrubuted via RolacoTools
+#ty @malonin0807 for properly porting it to powershell
+#changes are commented with #+
+
 Write-Host "Starting ST Fixer..." -ForegroundColor Cyan
 
 # Step 1: Find Steam client install location through registry
