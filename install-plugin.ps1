@@ -1,323 +1,635 @@
-# Anyone seeing this? well don't waste time improving this script.
-# It's messy and just temporary until i get the new version.
-
-param(
-    [string]$DownloadLink, # Overwrites the download link (give a direct link)
-    [string]$PluginName, # Overwrites the plugin name
-    [int]$Branch # 1 for Rolaco Tools, 2 for steamtools-collection (overwrites the above two options)
-)
-
-## Configure this
-$Host.UI.RawUI.WindowTitle = "Rolaco Tools plugin installer | .gg/ZbrzCC8HaK"
-$name = "RolacoTools" # automatic first letter uppercase included
-$link = "https://github.com/Rolaco0/RolacoTools/releases/latest/download/RolacoTools.zip"
-$milleniumTimer = 5 # in seconds for auto-installation
-
+# LEGACY installer -- targets the older, legacy-path Millennium (v2.36.4) that
+# uses <Steam>\plugins and <Steam>\ext\config.json, paired with the Python
+# (legacy) RolacoTools plugin from madoiscool/ltsteamplugin.
+#
+# Differences vs. install-plugin.ps1 (the normal/new installer):
+#   - Millennium comes from ps.lua.tools/millennium-py.ps1 (pinned v2.36.4)
+#   - Plugin installs into <Steam>\plugins  (NOT <Steam>\millennium\plugins)
+#   - Config written to <Steam>\ext\config.json
+#   - Millennium auto-updates are forced OFF (so it won't upgrade to 3+ and
+#     migrate everything off the legacy path)
+#   - Plugin source is the Python repo (madoiscool/ltsteamplugin)
+#
+# Configuration -- edit these before running, or override via env vars:
+#   $env:LT_DOWNLOAD_LINK, $env:LT_PLUGIN_NAME, $env:LT_BRANCH, $env:LT_CULTURE
+$Script:DownloadLink = $env:LT_DOWNLOAD_LINK
+$Script:PluginName   = $env:LT_PLUGIN_NAME
+$Script:Branch       = if ($env:LT_BRANCH) { [int]$env:LT_BRANCH } else { 1 }
+$Script:Culture      = $env:LT_CULTURE
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 # fix SSL/TSL Error
+$Script:ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-chcp 65001 > $null
+$null = chcp 65001
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -AssemblyName System.Net.Http
 
-# Hidden defines
-$steam = (Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam").InstallPath
-$upperName = $name.Substring(0, 1).ToUpper() + $name.Substring(1).ToLower()
-if ( $DownloadLink ) {
-    $link = $DownloadLink
-}
-if ( $PluginName ) {
-    $name = $PluginName
-}
+# ---------------------------------------------------------------------------
+# Locale defaults
+# ---------------------------------------------------------------------------
+function Get-DefaultStrings {
+    param([string]$Culture)
 
+    $tables = @{
+        "en" = @{
+            Title                 = "RolacoTools plugin installer (legacy) | .gg/mGU77b9X7"
+            SteamRegNotFound      = "Steam registry key not found. Is Steam installed?"
+            SteamKilling          = "Stopping Steam"
+            SteamKilled           = "Steam stopped"
+            SteamtoolsFound       = "Steamtools already installed"
+            SteamtoolsNotFound    = "Steamtools not found"
+            SteamtoolsInstalling  = "Installing Steamtools"
+            SteamtoolsInstalled   = "Steamtools installed"
+            SteamtoolsRetrying    = "Steamtools installation failed, retrying..."
+            SteamtoolsFailed      = "Steamtools installation failed after 5 attempts"
+            MillenniumNotFound    = "Millennium not found"
+            MillenniumCountdown   = "Millennium will be installed in {0} second(s)... Press any key to cancel"
+            MillenniumCancelled   = "Installation cancelled by user"
+            MillenniumInstalling  = "Installing Millennium (legacy)"
+            MillenniumInstalled   = "Millennium installed"
+            MillenniumAlready     = "Millennium already installed"
+            MillenniumFirstBoot   = "Steam startup may be slower on first boot -- let it sit."
+            PluginUpdating        = "Plugin already installed, updating"
+            PluginDuplicates      = "Multiple conflicting copies found, cleaning up and reinstalling"
+            PluginDownloading     = "Downloading {0}"
+            PluginDownloadFailed  = "Failed to download {0}"
+            PluginExtracting      = "Extracting {0}"
+            PluginExtractFailed   = "Extraction failed, trying built-in Expand-Archive"
+            PluginInstalled       = "{0} installed"
+            PluginEnabled         = "Plugin enabled"
+            RemovingBeta          = "Cleaning up beta flag"
+            RemovingCfg           = "Cleaning up steam.cfg"
+            RemovingFlags         = "Cleaning up ForceX86 flags and offline mode"
+            StartingSteam         = "Starting Steam"
+            UpdateCheckDisabled   = "Millennium auto-updates disabled (keeps you on the legacy version)."
+            UpdateCheckManual     = "Check for Millennium updates manually if you want the latest."
 
-# Second option to get steamtools-collection plugin
-# use $branch = 2 ; irm ... | iex
-if ($br -eq 2 -or $Branch -eq 2) {
-    $name = "steamtools-collection"
-    $link = "https://github.com/clemdotla/steamtools-collection/releases/download/Latest/steamtools-collection.zip"
-}
-
-
-#### Logging defines ####
-function Log {
-    param ([string]$Type, [string]$Message, [boolean]$NoNewline = $false)
-
-    $Type = $Type.ToUpper()
-    switch ($Type) {
-        "OK" { $foreground = "Green" }
-        "INFO" { $foreground = "Cyan" }
-        "ERR" { $foreground = "Red" }
-        "WARN" { $foreground = "Yellow" }
-        "LOG" { $foreground = "Magenta" }
-        "AUX" { $foreground = "DarkGray" }
-        default { $foreground = "White" }
-    }
-
-    $date = Get-Date -Format "HH:mm:ss"
-    $prefix = if ($NoNewline) { "`r[$date] " } else { "[$date] " }
-    Write-Host $prefix -ForegroundColor "Cyan" -NoNewline
-
-    Write-Host [$Type] $Message -ForegroundColor $foreground -NoNewline:$NoNewline
-}
-Log "WARN" "Hey! Just letting you know that i'm working on a new version combining various scripts of the server"
-Log "AUX" "Will include language support on THIS script too, luv y'all brazilians"
-Write-Host
-
-# To hide IEX blue box thing
-$ProgressPreference = 'SilentlyContinue'
-
-
-
-Get-Process steam -ErrorAction SilentlyContinue | Stop-Process -Force
-
-
-#### Requirements part ####
-
-# Steamtools check
-# TODO: Make this prettier?
-function CheckSteamtools {
-    $files = @( "dwmapi.dll", "xinput1_4.dll" )
-    foreach($file in $files) {
-        if (!( Test-Path (Join-Path $steam $file) )) {
-            return $false
-        }
-    }
-    
-    return $true
-}
-
-$path = Join-Path $steam "dwmapi.dll"
-if ( CheckSteamtools ) {
-    Log "INFO" "Steamtools already installed"
-}
-else {
-    # Filtering the installation script
-    # $script = Invoke-RestMethod "https://steam.run"
-    $script = Invoke-RestMethod "https://RolacoTools.vercel.app/st.ps1"
-    $keptLines = @()
-
-    foreach ($line in $script -split "`n") {
-        $conditions = @( # Removes lines containing one of those
-            ($line -imatch "Start-Process" -and $line -imatch "steam"),
-            ($line -imatch "steam\.exe"),
-            ($line -imatch "Start-Sleep" -or $line -imatch "Write-Host"),
-            ($line -imatch "cls" -or $line -imatch "exit"),
-            ($line -imatch "Stop-Process" -and -not ($line -imatch "Get-Process"))
-        )
-        
-        if (-not($conditions -contains $true)) {
-            $keptLines += $line
-        }
-    }
-
-    $SteamtoolsScript = $keptLines -join "`n"
-    Log "ERR" "Steamtools not found."
-    
-    # Retrying with a max of 5
-    for ($i = 0; $i -lt 5; $i++) {
-
-        Log "AUX" "Install it at your own risk! Close this script if you don't want to."
-        Log "WARN" "Pressing any key will install steamtools (UI-less)."
-        
-        [void][System.Console]::ReadKey($true)
-        Write-Host
-        Log "WARN" "Installing Steamtools"
-        
-        Invoke-Expression $SteamtoolsScript *> $null
-
-        if ( CheckSteamtools ) {
-            Log "OK" "Steamtools installed"
-            break
-        }
-        else {
-            Log "ERR" "Steamtools installation failed, retrying..."
+            ErrorTitle            = "RolacoTools installer - ERROR"
+            ErrorHeader           = "AN ERROR OCCURRED"
+            ErrorBody             = "The RolacoTools plugin installer encountered a problem and could not complete. This is often caused by your ISP blocking the download servers we use."
+            ErrorFaq              = "Visit the server (.gg/mGU77b9X7) for more information & fixes."
+            ErrorExit             = "Press any key to exit."
         }
 
-    }
-}
+        "pt-BR" = @{
+            Title                 = "Instalador do RolacoTools (legado) | .gg/mGU77b9X7"
+            SteamRegNotFound      = "Steam não encontrada no registro. Sua Steam ta instalada?"
+            SteamKilling          = "Parando a Steam"
+            SteamKilled           = "Steam Encerrada"
+            SteamtoolsFound       = "Steamtools ja instalado"
+            SteamtoolsNotFound    = "Steamtools não encontrado"
+            SteamtoolsInstalling  = "Instalando Steamtools"
+            SteamtoolsInstalled   = "Steamtools instalado"
+            SteamtoolsRetrying    = "Falha ao instalar Steamtools, tentando denovo..."
+            SteamtoolsFailed      = "Falha ao instalar Steamtools após 5 tentativas"
+            MillenniumNotFound    = "Millennium não encontrado"
+            MillenniumCountdown   = "Millennium vai ser instalado em {0} segundo(s)... Aperte qualquer tecla pra cancelar"
+            MillenniumCancelled   = "Instalação cancelada pelo usuário"
+            MillenniumInstalling  = "Instalando Millennium (legado)"
+            MillenniumInstalled   = "Millennium instalado"
+            MillenniumAlready     = "O Millennium ja está instalado"
+            MillenniumFirstBoot   = "A Steam pode demorar um pouco pra abrir pela primeira vez -- deixa rolar."
+            PluginUpdating        = "Plugin já instalado, atualizando"
+            PluginDuplicates      = "Várias cópias conflitantes encontradas, limpando e reinstalando"
+            PluginDownloading     = "Baixando {0}"
+            PluginDownloadFailed  = "Falha ao baixar {0}"
+            PluginExtracting      = "Extraindo {0}"
+            PluginExtractFailed   = "Falha ao extrair, tentando via Expand-Archive"
+            PluginInstalled       = "{0} instalado"
+            PluginEnabled         = "Plugin habilitado"
+            RemovingBeta          = "Limpando flag de beta da Steam"
+            RemovingCfg           = "Apagando steam.cfg"
+            RemovingFlags         = "Limpando flags do ForceX86 e o modo offline"
+            StartingSteam         = "Abrindo a Steam"
+            UpdateCheckDisabled   = "Atualizações automáticas do Millennium desabilitadas (mantém você na versão legada)"
+            UpdateCheckManual     = "Verifique manualmente por atualizações do Millennium caso você queira a ultima versão"
 
-# Millenium check
-$milleniumInstalling = $false
-foreach ($file in @("millennium.dll", "python311.dll")) {
-    if (!( Test-Path (Join-Path $steam $file) )) {
-        
-        # Ask confirmation to download
-        Log "ERR" "Millenium not found, installation process will start in 5 seconds."
-        Log "WARN" "Press any key to cancel the installation."
-        
-        for ($i = $milleniumTimer; $i -ge 0; $i--) {
-            # Wheter a key was pressed
-            if ([Console]::KeyAvailable) {
-                Write-Host
-                Log "ERR" "Installation cancelled by user."
-                exit
-            }
-
-            Log "LOG" "Installing Millenium in $i second(s)... Press any key to cancel." $true
-            Start-Sleep -Seconds 1
+            ErrorTitle            = "Instalador do RolacoTools - ERRO"
+            ErrorHeader           = "OCORREU UM ERRO"
+            ErrorBody             = "O instalador do RolacoTools encontrou um problema e não pôde ser concluído. Isso geralmente é causado pela tua internet bloqueando nossos servidores de Download"
+            ErrorFaq              = "Visite o servidor (.gg/mGU77b9X7) pra mais informações e detalhes em como consertar"
+            ErrorExit             = "Aperte qualquer botão pra sair."
         }
-        Write-Host
 
+        "es" = @{
+            Title                 = "Instalador del plugin de RolacoTools (legado) | .gg/mGU77b9X7"
+            SteamRegNotFound      = "La clave de registro de Steam no se ha encontrado. Está Steam instalado?"
+            SteamKilling          = "Deteniendo Steam"
+            SteamKilled           = "Steam se ha detenido"
+            SteamtoolsFound       = "Steamtools ya está instalado"
+            SteamtoolsNotFound    = "Steamtools no se ha encontrado"
+            SteamtoolsInstalling  = "Instalando Steamtools"
+            SteamtoolsInstalled   = "Steamtools se ha instalado"
+            SteamtoolsRetrying    = "La instalación de Steamtools ha fallado, reintentando..."
+            SteamtoolsFailed      = "La instalación de Steamtools ha fallado despues de 5 intentos"
+            MillenniumNotFound    = "Millenium no encontrado"
+            MillenniumCountdown   = "Millenium sera instalado en {0} segundo(s) ... Presiona cualquier tecla para cancelar"
+            MillenniumCancelled   = "Instalación cancelada por el usuario"
+            MillenniumInstalling  = "Instalando Millenium (legado)"
+            MillenniumInstalled   = "Millenium instalado"
+            MillenniumAlready     = "Millenium ya estaba instalado"
+            MillenniumFirstBoot   = "La carga de steam puede ser más lenta la primera vez para cargar las dependencias -- espera pacientemente"
+            PluginUpdating        = "El plugin ya esta instalado, actualizando"
+            PluginDuplicates      = "Se encontraron varias copias en conflicto, limpiando y reinstalando"
+            PluginDownloading     = "Descargando {0}"
+            PluginDownloadFailed  = "Error al descargar {0}"
+            PluginExtracting      = "Extrayendo {0}"
+            PluginExtractFailed   = "Extracción fallida, intentando descomprimir archivos"
+            PluginInstalled       = "{0} instalado"
+            PluginEnabled         = "Plugin establecido"
+            RemovingBeta          = "Limpiando indicador beta"
+            RemovingCfg           = "Limpiando steam.cfg"
+            RemovingFlags         = "Limpiando flags de ForceX86 y el modo sin conexión"
+            StartingSteam         = "Iniciando Steam"
+            UpdateCheckDisabled   = "Las auto-actualizaciones de Millenium están deshabilitadas (te mantiene en la versión legada)"
+            UpdateCheckManual     = "Comprueba las actualizaciones de Millenium manualmente si necesitas la última versión"
 
+            ErrorTitle            = "Error con el instalador RolacoTools - ERROR"
+            ErrorHeader           = "UN ERROR HA OCURRIDO"
+            ErrorBody             = "El instalador del plugin RolacoTools encontró un problema y no pudo completarse. Esto suele ocurrir cuando tu proveedor de internet (ISP) bloquea los servidores de descarga que utilizamos."
+            ErrorFaq              = "Visita el servidor (.gg/mGU77b9X7) para mas información o fixes."
+            ErrorExit             = "Presiona cualquier tecla para salir."
+        }
 
-        Log "INFO" "Installing millenium"
+        "fr" = @{
+            Title                 = "Installateur du plugin RolacoTools (legacy) | .gg/mGU77b9X7"
+            SteamRegNotFound      = "Clé de registre steam introuvable. Est ce que Steam est installé?"
+            SteamKilling          = "Arrêt de Steam"
+            SteamKilled           = "Steam arreté"
+            SteamtoolsFound       = "Steamtools déjà installé"
+            SteamtoolsNotFound    = "Steamtools introuvable"
+            SteamtoolsInstalling  = "Installation de Steamtools"
+            SteamtoolsInstalled   = "Steamtools installé"
+            SteamtoolsRetrying    = "L'instalation de Steamtools a echoué, nouvelle tentative..."
+            SteamtoolsFailed      = "L'installation de Steamtools a echoué apres 5 tentatives"
+            MillenniumNotFound    = "Millennium introuvable"
+            MillenniumCountdown   = "Millennium sera installé dans {0} seconde(s)... Appuyez sur une touche pour annuler"
+            MillenniumCancelled   = "Installation annuléee par l'utilisateur"
+            MillenniumInstalling  = "Installation de Millennium (legacy)"
+            MillenniumInstalled   = "Millennium installé"
+            MillenniumAlready     = "Millennium déjà installé"
+            MillenniumFirstBoot   = "Le prochain lancement de Steam sera plus long -- laisser le temps."
+            PluginUpdating        = "Plugin déjà installé, mise à jour"
+            PluginDuplicates      = "Plusieurs copies en conflit trouvées, nettoyage et réinstallation"
+            PluginDownloading     = "Installation {0}"
+            PluginDownloadFailed  = "Echec de l'installation {0}"
+            PluginExtracting      = "Extraction {0}"
+            PluginExtractFailed   = "Extraction echouée, tentative avec la fonction native"
+            PluginInstalled       = "{0} installé"
+            PluginEnabled         = "Plugin activé"
+            RemovingBeta          = "Nettoyage de la beta"
+            RemovingCfg           = "Nettoyage de steam.cfg"
+            RemovingFlags         = "Nettoyage des flags ForceX86 et du mode hors ligne"
+            StartingSteam         = "Lancement de Steam"
+            UpdateCheckDisabled   = "Les mises à jour de Millennium ont été désactivée (vous garde sur la version legacy)."
+            UpdateCheckManual     = "Vérifiez manuellement les mises à jour de Millennium si vous souhaitez la derniere version."
 
-        Invoke-Expression "& { $(Invoke-RestMethod 'https://clemdotla.github.io/millennium-installer-ps1/millennium.ps1') } -NoLog -DontStart -SteamPath '$steam'"
-
-        Log "OK" "Millenium done installing"
-        $milleniumInstalling = $true
-        break
-    }
-}
-if ($milleniumInstalling -eq $false) { Log "INFO" "Millenium already installed" }
-
-
-
-#### Plugin part ####
-# Ensuring \Steam\plugins
-if (!( Test-Path (Join-Path $steam "plugins") )) {
-    New-Item -Path (Join-Path $steam "plugins") -ItemType Directory *> $null
-}
-
-
-$Path = Join-Path $steam "plugins\$name" # Defaulting if no install found
-
-# Checking for plugin named "$name"
-foreach ($plugin in Get-ChildItem -Path (Join-Path $steam "plugins") -Directory) {
-    $testpath = Join-Path $plugin.FullName "plugin.json"
-    if (Test-Path $testpath) {
-        $json = Get-Content $testpath -Raw | ConvertFrom-Json
-        if ($json.name -eq $name) {
-            Log "INFO" "Plugin already installed, updating it"
-            $Path = $plugin.FullName # Replacing default path
-            break
+            ErrorTitle            = "Installateur RolacoTools - ERREUR"
+            ErrorHeader           = "UNE ERREUR EST SURVENUE"
+            ErrorBody             = "L'installation du plugin RolacoTools a rencontré un problème et n'a pas pu se terminer. Ça se produit souvent quand votre fournisseur d'internet (ISP) bloque les serveurs de téléchargement."
+            ErrorFaq              = "Allez voir le serveur (.gg/mGU77b9X7) pour plus d'informations & corrections."
+            ErrorExit             = "Appuyez sur une touche pour quitter."
         }
     }
+
+    foreach ($key in @($Culture, $Culture.Split('-')[0], "en")) {
+        if ($tables.ContainsKey($key)) {
+            return $tables[$key]
+        }
+    }
+    return $tables["en"]
 }
 
-# Installation 
-$subPath = Join-Path $env:TEMP "$name.zip"
+# ---------------------------------------------------------------------------
+# Resolve messages based on locale
+# ---------------------------------------------------------------------------
+$DetectedCulture = if ($Script:Culture) { $Script:Culture } else { [System.Globalization.CultureInfo]::CurrentUICulture.Name }
+$L = Get-DefaultStrings -Culture $DetectedCulture
 
-Log "LOG" "Downloading $name"
-if ($DownloadLink) { Log "Aux" $($link) }
-Invoke-WebRequest -Uri $link -OutFile $subPath *> $null
-if ( !( Test-Path $subPath ) ) {
-    Log "ERR" "Failed to download $name"
-    exit
+# ---------------------------------------------------------------------------
+# Global error trap -- catches ANY terminating error and shows error page
+# MUST be placed after $L is populated so error strings are available
+# ---------------------------------------------------------------------------
+$Script:OriginalErrorAction = $ErrorActionPreference
+$ErrorActionPreference = "Stop"
+
+trap {
+    $errMsg = $_.Exception.Message
+
+    # Ensure $L has something even if the hashtable failed
+    if (-not $L) { $L = Get-DefaultStrings -Culture "en" }
+
+    $host.UI.RawUI.CursorPosition = @{ X=0; Y=0 }
+    $errTitle = if ($L.ContainsKey("ErrorTitle")) { $L["ErrorTitle"] } else { "RolacoTools installer - ERROR" }
+    $host.UI.RawUI.WindowTitle = $errTitle
+    Clear-Host
+
+    $width = $host.UI.RawUI.WindowSize.Width
+
+    Write-Host ("=" * $width) -ForegroundColor Red
+    Write-Host ""
+
+    $header = if ($L.ContainsKey("ErrorHeader")) { $L["ErrorHeader"] } else { "AN ERROR OCCURRED" }
+    $pad = [Math]::Max(0, [int](($width - $header.Length) / 2))
+    Write-Host (" " * $pad) -NoNewline
+    Write-Host $header -ForegroundColor Red -BackgroundColor Black
+    Write-Host ""
+
+    $body = if ($L.ContainsKey("ErrorBody")) { $L["ErrorBody"] } else { "The installer encountered a problem." }
+    Write-Host $body -ForegroundColor White
+    Write-Host ""
+
+    Write-Host ">>> " -NoNewline -ForegroundColor Yellow
+    Write-Host $errMsg -ForegroundColor Gray
+    Write-Host ""
+
+    $faq = if ($L.ContainsKey("ErrorFaq")) { $L["ErrorFaq"] } else { "Visit (.gg/mGU77b9X7)" }
+    Write-Host $faq -ForegroundColor Cyan
+    Write-Host ""
+
+    Write-Host ("=" * $width) -ForegroundColor Red
+    Write-Host ""
+
+    $exitMsg = if ($L.ContainsKey("ErrorExit")) { $L["ErrorExit"] } else { "Press any key to exit." }
+    Write-Host $exitMsg -ForegroundColor Yellow
+    try { $null = [System.Console]::ReadKey($true) } catch {}
+
+    $ErrorActionPreference = $Script:OriginalErrorAction
+    break
 }
-Log "LOG" "Unzipping $name"
-try {      
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($subPath)
-    foreach ($entry in $zip.Entries) {
-        $destinationPath = Join-Path $Path $entry.FullName
-        
-        if (-not $entry.FullName.EndsWith('/') -and -not $entry.FullName.EndsWith('\')) {
-            $parentDir = Split-Path -Path $destinationPath -Parent
-            if ($parentDir -and $parentDir.Trim() -ne '') {
-                $pathParts = $parentDir -replace [regex]::Escape($steam), '' -split '[\\/]' | Where-Object { $_ }
-                $currentPath = $Path
-                
-                foreach ($part in $pathParts) {
-                    $currentPath = Join-Path $currentPath $part
-                    if (Test-Path $currentPath) {
-                        $item = Get-Item $currentPath
-                        if (-not $item.PSIsContainer) {
-                            Remove-Item $currentPath -Force
-                        }
-                    }
+
+# ---------------------------------------------------------------------------
+# Console helpers
+# ---------------------------------------------------------------------------
+$Host.UI.RawUI.WindowTitle = $L["Title"]
+
+$LogColors = @{
+    "OK"   = "Green"
+    "INFO" = "Cyan"
+    "ERR"  = "Red"
+    "WARN" = "Yellow"
+    "LOG"  = "Magenta"
+    "AUX"  = "DarkGray"
+}
+
+function Write-Log {
+    param(
+        [ValidateSet("OK","INFO","ERR","WARN","LOG","AUX")]
+        [string]$Type,
+        [string]$Message,
+        [switch]$NoNewline
+    )
+    $color = $LogColors[$Type]
+    $ts = Get-Date -Format "HH:mm:ss"
+    if ($NoNewline) {
+        Write-Host "`r[$ts] " -ForegroundColor Cyan -NoNewline
+        Write-Host "[$Type] $Message" -ForegroundColor $color -NoNewline
+    } else {
+        Write-Host "[$ts] " -ForegroundColor Cyan -NoNewline
+        Write-Host "[$Type] $Message" -ForegroundColor $color
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+$Script:Name      = "RolacoTools"
+$Script:Link      = "https://github.com/Rolaco0/RolacoTools/releases/latest/download/RolacoTools.zip"
+$MillenniumTimer  = 5
+
+if ($Script:Branch -eq 2) {
+    $Script:Name = "steamtools-collection"
+    $Script:Link = "https://github.com/clemdotla/steamtools-collection/releases/download/Latest/steamtools-collection.zip"
+}
+if ($Script:DownloadLink) { $Script:Link = $Script:DownloadLink }
+if ($Script:PluginName)   { $Script:Name = $Script:PluginName }
+
+$DisplayName = $Script:Name.Substring(0,1).ToUpper() + $Script:Name.Substring(1).ToLower()
+
+# ---------------------------------------------------------------------------
+# Steam path
+# ---------------------------------------------------------------------------
+function Get-SteamPath {
+    $registries = @(
+        "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam",
+        "HKLM:\SOFTWARE\Valve\Steam",
+        "HKCU:\SOFTWARE\Valve\Steam"
+    )
+
+    foreach ($reg in $registries) {
+        if (!(Test-Path $reg)) { continue }
+
+        $path = (Get-ItemProperty -Path $reg -Name "InstallPath" -ErrorAction SilentlyContinue).InstallPath
+        $potentialExe = Join-Path $path "steam.exe"
+        if ((Test-Path $path) -and (Test-Path $potentialExe)) {
+            return $path
+        }
+    }
+    Write-Log -Type ERR -Message $L["SteamRegNotFound"]
+}
+
+# ---------------------------------------------------------------------------
+# Steamtools -- REQUIRED, no user choice
+# ---------------------------------------------------------------------------
+function Test-Steamtools {
+    param([string]$SteamPath)
+    foreach ($f in @("dwmapi.dll", "xinput1_4.dll")) {
+        if (Test-Path (Join-Path $SteamPath $f)) { return $true }
+    }
+    return $false
+}
+
+function Install-Steamtools {
+    param([string]$SteamPath)
+
+    Write-Log -Type WARN -Message $L["SteamtoolsInstalling"]
+
+    # Steamtools is installed via CloudRedirect's prebuilt CLI (the /stfixer
+    # routine), rather than fetching and eval'ing a remote PowerShell script.
+    # Download into the Steam folder (clean ASCII path, always writable) instead
+    # of %TEMP%, which mangles to a broken 8.3 short path on accounts whose
+    # username has a space/non-ASCII char (e.g. C:\Users\EAF7~1).
+    $exe = Join-Path $SteamPath "CloudRedirectCLI.exe"
+    Invoke-WebRequest -Uri "https://github.com/Selectively11/CloudRedirect/releases/latest/download/CloudRedirectCLI.exe" -OutFile $exe -TimeoutSec 60 -UseBasicParsing
+    if (-not (Test-Path $exe)) { throw $L["SteamtoolsFailed"] }
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        Write-Log -Type LOG -Message $L["SteamtoolsInstalling"]
+        Start-Process $exe "/stfixer" -Wait
+        if (Test-Steamtools $SteamPath) {
+            Write-Log -Type OK -Message $L["SteamtoolsInstalled"]
+            Remove-Item $exe -Force -ErrorAction SilentlyContinue
+            return
+        }
+        Write-Log -Type ERR -Message $L["SteamtoolsRetrying"]
+    }
+
+    Remove-Item $exe -Force -ErrorAction SilentlyContinue
+    throw $L["SteamtoolsFailed"]
+}
+
+# ---------------------------------------------------------------------------
+# Millennium -- legacy (pinned v2.36.4 via ps.lua.tools/millennium-py.ps1)
+# ---------------------------------------------------------------------------
+function Test-Millennium {
+    param([string]$SteamPath)
+    # wsock32.dll is the Millennium proxy DLL dropped at the Steam root by BOTH
+    # v2.x and v3.x; millennium.dll / python311.dll only exist on the older v2.x
+    # layout. Match on any of them so detection works across versions.
+    foreach ($f in @("wsock32.dll", "millennium.dll", "python311.dll")) {
+        if (Test-Path -LiteralPath (Join-Path $SteamPath $f)) { return $true }
+    }
+    return $false
+}
+
+function Install-Millennium {
+    param([string]$SteamPath)
+
+    Write-Log -Type INFO -Message $L["MillenniumInstalling"]
+    $msUrls = @(
+        "https://ps.lua.tools/millennium-py.ps1"
+    )
+    $msCode = $null
+    foreach ($url in $msUrls) {
+        try {
+            $msCode = Invoke-RestMethod $url -TimeoutSec 30
+            if ($msCode) { break }
+        } catch {}
+    }
+    if (-not $msCode) { throw $L["MillenniumNotFound"] }
+    Invoke-Expression "& { $msCode } -NoLog -DontStart -SteamPath '$SteamPath'"
+
+    if (Test-Millennium $SteamPath) {
+        Write-Log -Type OK -Message $L["MillenniumInstalled"]
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Plugin install / update -- legacy <Steam>\plugins path
+# ---------------------------------------------------------------------------
+function Install-Plugin {
+    param([string]$SteamPath, [string]$Name, [string]$Link)
+
+    # Legacy Millennium uses <Steam>\plugins and never touches the newer
+    # <Steam>\millennium\plugins path, so everything stays here.
+    $pluginsDir = Join-Path $SteamPath "plugins"
+    if (-not (Test-Path $pluginsDir)) {
+        $null = New-Item -Path $pluginsDir -ItemType Directory -Force
+    }
+
+    # Find any folder under <Steam>\plugins whose plugin.json declares our
+    # plugin name. The folder may be named anything (e.g. a manual install),
+    # so we match on the plugin.json "name" field rather than the folder name.
+    $found = [System.Collections.Generic.List[string]]::new()
+    foreach ($dir in (Get-ChildItem $pluginsDir -Directory -ErrorAction SilentlyContinue)) {
+        $j = Join-Path $dir.FullName "plugin.json"
+        if (Test-Path $j) {
+            try {
+                $m = Get-Content $j -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($m.name -eq $Name) { $found.Add($dir.FullName) }
+            } catch {}
+        }
+    }
+
+    $targetDir = Join-Path $pluginsDir $Name
+    if ($found.Count -eq 1) {
+        # Single existing install -> update it in place (any folder name).
+        Write-Log -Type INFO -Message $L["PluginUpdating"]
+        $targetDir = $found[0]
+    } elseif ($found.Count -gt 1) {
+        # Multiple folders claim this plugin name -> remove every copy and
+        # reinstall a single canonical folder to avoid a Millennium collision.
+        Write-Log -Type WARN -Message $L["PluginDuplicates"]
+        foreach ($dup in $found) {
+            Remove-Item $dup -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        $targetDir = Join-Path $pluginsDir $Name
+    }
+
+    $zipPath = Join-Path $SteamPath "$Name.zip"
+
+    Write-Log -Type LOG -Message ($L["PluginDownloading"] -f $Name)
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.Timeout = [System.TimeSpan]::FromSeconds(60)
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (RolacoTools Installer)")
+
+    $stream = $client.GetStreamAsync($Link).Result
+    $fileStream = [System.IO.File]::Create($zipPath)
+    $stream.CopyTo($fileStream)
+
+    $fileStream.Close()
+    $stream.Close()
+    $client.Dispose()
+
+    if (-not (Test-Path $zipPath)) {
+        throw ($L["PluginDownloadFailed"] -f $Name)
+    }
+
+    Write-Log -Type LOG -Message ($L["PluginExtracting"] -f $Name)
+
+    try {
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+        foreach ($entry in $zip.Entries) {
+            if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')) { continue }
+            $dest   = Join-Path $targetDir $entry.FullName
+            $parent = Split-Path $dest -Parent
+
+            $relParts = $parent.Substring($targetDir.Length).TrimStart('\','/') -split '[\\/]' | Where-Object { $_ }
+            $cursor = $targetDir
+            foreach ($part in $relParts) {
+                $cursor = Join-Path $cursor $part
+                if (Test-Path $cursor) {
+                    $item = Get-Item $cursor
+                    if (-not $item.PSIsContainer) { Remove-Item $cursor -Force }
                 }
-                
-                [System.IO.Directory]::CreateDirectory($parentDir) | Out-Null
-                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destinationPath, $true)
             }
+
+            $null = [System.IO.Directory]::CreateDirectory($parent)
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
         }
-    }
-    
-    $zip.Dispose()
-}
-catch {
-    write-host "Error: $($_.Exception.Message)"
-    if ($zip) { $zip.Dispose() }
-    Log "ERR" "Extraction failed, trying normal way"
-    Expand-Archive -Path $subPath -DestinationPath $Path -Force
-}
-
-
-if ( Test-Path $subPath ) {
-    Remove-Item $subPath -ErrorAction SilentlyContinue
-}
-
-Log "OK" "$upperName installed"
-
-
-# Removing beta
-$betaPath = Join-Path $steam "package\beta"
-if ( Test-Path $betaPath ) {
-    Remove-Item $betaPath -Recurse -Force
-}
-# Removing potential x32 (kinda greedy but ppl got issues and was hard to fix without knowing it was the issue, ppl don't know what they run)
-$cfgPath = Join-Path $steam "steam.cfg"
-if ( Test-Path $cfgPath ) {
-    Remove-Item $cfgPath -Recurse -Force
-}
-Remove-ItemProperty -Path "HKCU:\Software\Valve\Steam" -Name "SteamCmdForceX86" -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path "HKLM:\SOFTWARE\Valve\Steam" -Name "SteamCmdForceX86" -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam" -Name "SteamCmdForceX86" -ErrorAction SilentlyContinue
-
-
-# Toggling the plugin on (+turning off updateChecking to try fixing a bug where steam doesn't start)
-$configPath = Join-Path $steam "ext/config.json"
-if (-not (Test-Path $configPath)) {
-    $config = @{
-        plugins = @{
-            enabledPlugins = @($name)
-        }
-        general = @{
-            checkForMillenniumUpdates = $false
-        }
-    }
-    New-Item -Path (Split-Path $configPath) -ItemType Directory -Force | Out-Null
-    $config | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
-}
-else {
-    $config = (Get-Content $configPath -Raw -Encoding UTF8) | ConvertFrom-Json
-
-    function _EnsureProperty {
-        param($Object, $PropertyName, $DefaultValue)
-        if (-not $Object.$PropertyName) {
-            $Object | Add-Member -MemberType NoteProperty -Name $PropertyName -Value $DefaultValue -Force
-        }
+        $zip.Dispose()
+    } catch {
+        if ($zip) { $zip.Dispose() }
+        Write-Log -Type WARN -Message $L["PluginExtractFailed"]
+        Expand-Archive -Path $zipPath -DestinationPath $targetDir -Force
     }
 
-    _EnsureProperty $config "general" @{}
-    _EnsureProperty $config "general.checkForMillenniumUpdates" $false
-    $config.general.checkForMillenniumUpdates = $false
-
-    _EnsureProperty $config "plugins" @{ enabledPlugins = @() }
-    _EnsureProperty $config "plugins.enabledPlugins" @()
-    
-    $pluginsList = @($config.plugins.enabledPlugins)
-    if ($pluginsList -notcontains $name) {
-        $pluginsList += $name
-        $config.plugins.enabledPlugins = $pluginsList
-    }
-    
-    $config | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
+    if (Test-Path $zipPath) { Remove-Item $zipPath -ErrorAction SilentlyContinue }
+    Write-Log -Type OK -Message ($L["PluginInstalled"] -f $DisplayName)
 }
-Log "OK" "Plugin enabled"
 
+# ---------------------------------------------------------------------------
+# Config -- legacy <Steam>\ext\config.json, with updates forced OFF
+# ---------------------------------------------------------------------------
+function Enable-Plugin {
+    param([string]$SteamPath, [string]$Name)
 
-# Result showing
-Write-Host
-if ($milleniumInstalling) { Log "WARN" "Steam startup will be longer, don't panic and don't touch anything in steam!" }
+    # Legacy Millennium reads its config from <Steam>\ext\config.json. We also
+    # force general.checkForMillenniumUpdates = false so Millennium won't
+    # auto-upgrade to 3+ and migrate plugins off the legacy <Steam>\plugins path.
+    $configPath = Join-Path $SteamPath "ext\config.json"
 
+    if (-not (Test-Path $configPath)) {
+        $config = @{
+            general = @{ checkForMillenniumUpdates = $false }
+            plugins = @{ enabledPlugins = @($Name) }
+        }
+        New-Item -Path (Split-Path $configPath) -ItemType Directory -Force | Out-Null
+        $config | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
+    }
+    else {
+        $config = (Get-Content $configPath -Raw -Encoding UTF8) | ConvertFrom-Json
 
-# Start with the "-clearbeta" argument
-$exe = Join-Path $steam "steam.exe"
-Start-Process $exe -ArgumentList "-clearbeta"
+        # Ensure general.checkForMillenniumUpdates is present and OFF.
+        if (-not $config.general) {
+            $config | Add-Member -MemberType NoteProperty -Name "general" -Value ([PSCustomObject]@{}) -Force
+        }
+        $config.general | Add-Member -MemberType NoteProperty -Name "checkForMillenniumUpdates" -Value $false -Force
 
-Log "INFO" "Starting steam"
-Log "WARN" "Hey so there's a bug where steam may not start"
-Log "WARN" "Hopefully this script fixes it"
-Log "WARN" "But i had to turn updates of millennium off."
-Log "WARN" "In future, they will come back but in the meantime:"
-Log "OK" "Manually check for updates of millennium if you want up to date."
-Log "AUX" "Millennium is working now tho (latest version)."
+        # Ensure plugins.enabledPlugins contains our plugin name.
+        if (-not $config.plugins) {
+            $config | Add-Member -MemberType NoteProperty -Name "plugins" -Value ([PSCustomObject]@{ enabledPlugins = @() }) -Force
+        }
+        if (-not $config.plugins.enabledPlugins) {
+            $config.plugins | Add-Member -MemberType NoteProperty -Name "enabledPlugins" -Value @() -Force
+        }
+
+        $pluginsList = @($config.plugins.enabledPlugins)
+        if ($pluginsList -notcontains $Name) {
+            $pluginsList += $Name
+            $config.plugins.enabledPlugins = $pluginsList
+        }
+
+        $config | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
+    }
+
+    Write-Log -Type OK -Message $L["PluginEnabled"]
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+function Remove-BetaFlag {
+    param([string]$SteamPath)
+    $beta = Join-Path $SteamPath "package\beta"
+    if (Test-Path $beta) {
+        Write-Log -Type AUX -Message $L["RemovingBeta"]
+        Remove-Item $beta -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Reset-SteamFlags {
+    param([string]$SteamPath)
+    Write-Log -Type AUX -Message $L["RemovingFlags"]
+
+    # Clear ForceX86 (32-bit) registry flags
+    @("HKCU:\Software\Valve\Steam","HKLM:\SOFTWARE\Valve\Steam","HKLM:\SOFTWARE\WOW6432Node\Valve\Steam") | ForEach-Object {
+        Remove-ItemProperty -Path $_ -Name "SteamCmdForceX86" -ErrorAction SilentlyContinue
+    }
+
+    # Reset Steam offline mode for all accounts (WantsOfflineMode "1" -> "0")
+    $loginUsersPath = Join-Path $SteamPath "config\loginusers.vdf"
+    if (Test-Path $loginUsersPath) {
+        $content = Get-Content -Path $loginUsersPath -Raw
+        if ($content -match '"WantsOfflineMode"\s+"1"') {
+            $newContent = $content -replace '("WantsOfflineMode"\s+)"1"', '$1"0"'
+            Set-Content -Path $loginUsersPath -Value $newContent -Encoding UTF8
+        }
+    }
+}
+
+function Remove-SteamCfg {
+    param([string]$SteamPath)
+    $cfg = Join-Path $SteamPath "steam.cfg"
+    if (Test-Path $cfg) {
+        Write-Log -Type AUX -Message $L["RemovingCfg"]
+        Remove-Item $cfg -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+function Main {
+
+    $steamPath = Get-SteamPath
+
+    Write-Log -Type INFO -Message $L["SteamKilling"]
+    while (Get-Process steam -ErrorAction SilentlyContinue) {
+        Get-Process steam -ErrorAction SilentlyContinue | Stop-Process -Force
+        Start-Sleep -Milliseconds 500
+    }
+
+    if (Test-Steamtools $steamPath) {
+        Write-Log -Type INFO -Message $L["SteamtoolsFound"]
+    } else {
+        Write-Log -Type ERR -Message $L["SteamtoolsNotFound"]
+        Install-Steamtools $steamPath
+    }
+
+    $millenniumWasInstalled = Test-Millennium $steamPath
+    Install-Millennium $steamPath
+
+    Install-Plugin $steamPath $Script:Name $Script:Link
+
+    Remove-BetaFlag $steamPath
+    Remove-SteamCfg $steamPath
+    Reset-SteamFlags $steamPath
+
+    Enable-Plugin $steamPath $Script:Name
+
+    Write-Host
+    if (-not $millenniumWasInstalled) {
+        Write-Log -Type WARN -Message $L["MillenniumFirstBoot"]
+    }
+    Write-Log -Type WARN -Message $L["UpdateCheckDisabled"]
+
+    Write-Log -Type INFO -Message $L["StartingSteam"]
+    Start-Process (Join-Path $steamPath "steam.exe") -ArgumentList "-clearbeta"
+    $ErrorActionPreference = $Script:OriginalErrorAction
+}
+
+Main
+
+# By clem
+# Waike contributed a lot
+# Legacy variant
